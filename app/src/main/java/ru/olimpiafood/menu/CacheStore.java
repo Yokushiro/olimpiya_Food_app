@@ -1,12 +1,18 @@
 package ru.olimpiafood.menu;
 
+import android.content.res.AssetManager;
+import android.net.Uri;
 import android.text.TextUtils;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
@@ -21,16 +27,24 @@ import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
- * Офлайн-кеш: "сначала сеть, потом кеш".
- *  - есть интернет  -> берём свежую версию с сайта и перезаписываем кеш (так подтягиваются обновления);
- *  - интернета нет  -> отдаём последнюю сохранённую копию.
- * Кешируются все GET-запросы (страница, скрипты, стили, картинки, API-запросы данных).
+ * Кеш для WebView.
+ *
+ * Картинки: берутся мгновенно из локального кеша. Если в кеше пусто — из вшитых в APK файлов
+ * (assets/preload). Раз за запуск приложения каждая картинка тихо проверяется на сайте в фоне
+ * (условный запрос If-None-Match / If-Modified-Since), и если на сайте она изменилась — обновляется.
+ *
+ * Всё остальное (страница, скрипты, данные меню): сначала сеть, при её отсутствии — кеш.
  */
 class CacheStore {
 
@@ -39,13 +53,53 @@ class CacheStore {
             "connection", "keep-alive", "set-cookie", "cache-control", "expires",
             "etag", "last-modified", "pragma", "vary", "alt-svc");
 
-    private final File dir;
-    private final Object lock = new Object();
+    private static final List<String> IMAGE_EXT = Arrays.asList(
+            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif", ".ico");
 
-    CacheStore(File dir) {
+    private static class Bundled {
+        String file, mime, etag, lastMod;
+    }
+
+    private static class Meta {
+        String mime = "application/octet-stream";
+        String enc = "";
+        String etag = "";
+        String lastMod = "";
+        Map<String, String> headers = new HashMap<>();
+    }
+
+    private final File dir;
+    private final AssetManager assets;
+    private final Object lock = new Object();
+    private final Map<String, Bundled> bundled = new HashMap<>();
+    private final Set<String> checkedThisRun = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private final ExecutorService bg = Executors.newFixedThreadPool(3);
+
+    CacheStore(File dir, AssetManager assets) {
         this.dir = dir;
+        this.assets = assets;
         //noinspection ResultOfMethodCallIgnored
         dir.mkdirs();
+        loadManifest();
+    }
+
+    private void loadManifest() {
+        try (InputStream in = assets.open("preload/manifest.json")) {
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            pump(in, bo);
+            JSONArray arr = new JSONArray(new String(bo.toByteArray(), StandardCharsets.UTF_8));
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                Bundled b = new Bundled();
+                b.file = o.getString("file");
+                b.mime = o.optString("mime", "application/octet-stream");
+                b.etag = o.optString("etag", "");
+                b.lastMod = o.optString("lastModified", "");
+                bundled.put(o.getString("url"), b);
+            }
+        } catch (Exception ignored) {
+            // вшитых картинок нет — работаем только с кешем
+        }
     }
 
     WebResourceResponse handle(WebResourceRequest req) {
@@ -67,7 +121,11 @@ class CacheStore {
         File meta = new File(dir, key + ".meta");
 
         try {
-            return fetchAndStore(url, rh, body, meta);
+            if (isImage(url, rh, req.isForMainFrame())) {
+                WebResourceResponse r = imageFromCacheOrBundle(url, rh, body, meta);
+                if (r != null) return r;
+            }
+            return fetchAndStore(url, rh, body, meta, "", "");
         } catch (Exception e) {
             try {
                 WebResourceResponse cached = readCache(body, meta);
@@ -77,8 +135,88 @@ class CacheStore {
         }
     }
 
-    private WebResourceResponse fetchAndStore(String url, Map<String, String> rh, File body, File meta)
+    // ---------------------------------------------------------------- картинки
+
+    private WebResourceResponse imageFromCacheOrBundle(String url, Map<String, String> rh, File body, File meta)
             throws IOException {
+        if (!(body.exists() && meta.exists())) {
+            if (!seedFromAsset(url, body, meta)) return null; // нет ни в кеше, ни в APK -> качаем
+        }
+        WebResourceResponse r = readCache(body, meta);
+        if (r != null && checkedThisRun.add(url)) scheduleRevalidate(url, rh, body, meta);
+        return r;
+    }
+
+    private void scheduleRevalidate(final String url, Map<String, String> rh, final File body, final File meta) {
+        final Map<String, String> headers = rh == null ? null : new HashMap<String, String>(rh);
+        bg.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Meta m = readMeta(meta);
+                    WebResourceResponse r = fetchAndStore(url, headers, body, meta, m.etag, m.lastMod);
+                    if (r != null && r.getData() != null) r.getData().close();
+                } catch (Exception ignored) {
+                    // нет сети — остаётся то, что в кеше
+                }
+            }
+        });
+    }
+
+    private boolean seedFromAsset(String url, File body, File meta) {
+        Bundled b = bundled.get(url);
+        if (b == null) return false;
+        File tmp = new File(body.getPath() + "." + System.nanoTime() + ".tmp");
+        File metaTmp = new File(meta.getPath() + "." + System.nanoTime() + ".tmp");
+        try {
+            try (InputStream in = assets.open("preload/" + b.file);
+                 OutputStream out = new BufferedOutputStream(new FileOutputStream(tmp))) {
+                pump(in, out);
+            }
+            Meta m = new Meta();
+            m.mime = b.mime;
+            m.etag = b.etag;
+            m.lastMod = b.lastMod;
+            writeMeta(metaTmp, m);
+            synchronized (lock) {
+                //noinspection ResultOfMethodCallIgnored
+                tmp.renameTo(body);
+                //noinspection ResultOfMethodCallIgnored
+                metaTmp.renameTo(meta);
+            }
+            return true;
+        } catch (IOException e) {
+            return false;
+        } finally {
+            tmp.delete();
+            metaTmp.delete();
+        }
+    }
+
+    private static boolean isImage(String url, Map<String, String> rh, boolean mainFrame) {
+        if (mainFrame) return false;
+        String path = Uri.parse(url).getPath();
+        if (path != null) {
+            String p = path.toLowerCase(Locale.ROOT);
+            for (String ext : IMAGE_EXT) {
+                if (p.endsWith(ext)) return true;
+            }
+        }
+        if (rh != null) {
+            for (Map.Entry<String, String> e : rh.entrySet()) {
+                if (e.getKey().equalsIgnoreCase("Accept") && e.getValue() != null
+                        && e.getValue().trim().toLowerCase(Locale.ROOT).startsWith("image/")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // ---------------------------------------------------------------- сеть
+
+    private WebResourceResponse fetchAndStore(String url, Map<String, String> rh, File body, File meta,
+                                              String etag, String lastMod) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(6000);
         c.setReadTimeout(15000);
@@ -94,11 +232,22 @@ class CacheStore {
             }
         }
         c.setRequestProperty("Cache-Control", "no-cache");
+        if (etag != null && !etag.isEmpty()) c.setRequestProperty("If-None-Match", etag);
+        if (lastMod != null && !lastMod.isEmpty()) c.setRequestProperty("If-Modified-Since", lastMod);
 
         int code = c.getResponseCode();
         if (code >= 500) {
             c.disconnect();
             throw new IOException("HTTP " + code); // сервер недоступен -> уйдём в кеш
+        }
+        if (code == 304) { // на сайте без изменений
+            long now = System.currentTimeMillis();
+            //noinspection ResultOfMethodCallIgnored
+            body.setLastModified(now);
+            //noinspection ResultOfMethodCallIgnored
+            meta.setLastModified(now);
+            c.disconnect();
+            return readCache(body, meta);
         }
         if (code >= 300 && code < 400) return null; // пусть WebView сам обработает
         if (code < 200 || code >= 300) {
@@ -118,22 +267,18 @@ class CacheStore {
         try {
             try (InputStream in = c.getInputStream();
                  OutputStream out = new BufferedOutputStream(new FileOutputStream(tmp))) {
-                byte[] buf = new byte[16384];
-                int n;
-                while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                pump(in, out);
             }
-            String mime = mimeOf(c, url);
+            Meta m = new Meta();
+            m.mime = mimeOf(c, url);
             String enc = encOf(c);
-            Map<String, String> h = headersOf(c);
-            try (DataOutputStream d = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(metaTmp)))) {
-                d.writeUTF(mime);
-                d.writeUTF(enc == null ? "" : enc);
-                d.writeInt(h.size());
-                for (Map.Entry<String, String> e : h.entrySet()) {
-                    d.writeUTF(e.getKey());
-                    d.writeUTF(e.getValue());
-                }
-            }
+            m.enc = enc == null ? "" : enc;
+            String et = c.getHeaderField("ETag");
+            String lm = c.getHeaderField("Last-Modified");
+            m.etag = et == null ? "" : et;
+            m.lastMod = lm == null ? "" : lm;
+            m.headers = headersOf(c);
+            writeMeta(metaTmp, m);
             synchronized (lock) {
                 //noinspection ResultOfMethodCallIgnored
                 tmp.renameTo(body);
@@ -150,27 +295,58 @@ class CacheStore {
         return r;
     }
 
+    // ---------------------------------------------------------------- чтение/запись кеша
+
     private WebResourceResponse readCache(File body, File meta) throws IOException {
         if (!body.exists() || !meta.exists()) return null;
-        String mime = "application/octet-stream";
-        String enc = "";
-        Map<String, String> h = new HashMap<>();
-        try (DataInputStream d = new DataInputStream(new BufferedInputStream(new FileInputStream(meta)))) {
-            mime = d.readUTF();
-            enc = d.readUTF();
-            int n = d.readInt();
-            for (int i = 0; i < n; i++) {
-                String k = d.readUTF();
-                String v = d.readUTF();
-                h.put(k, v);
-            }
-        }
+        Meta m = readMeta(meta);
+        Map<String, String> h = new HashMap<>(m.headers);
         boolean hasCors = false;
         for (String k : h.keySet()) {
             if (k.equalsIgnoreCase("Access-Control-Allow-Origin")) hasCors = true;
         }
         if (!hasCors) h.put("Access-Control-Allow-Origin", "*");
-        return new WebResourceResponse(mime, enc.isEmpty() ? null : enc, 200, "OK", h, new FileInputStream(body));
+        return new WebResourceResponse(m.mime, m.enc.isEmpty() ? null : m.enc, 200, "OK", h,
+                new FileInputStream(body));
+    }
+
+    private static Meta readMeta(File f) throws IOException {
+        Meta m = new Meta();
+        try (DataInputStream d = new DataInputStream(new BufferedInputStream(new FileInputStream(f)))) {
+            m.mime = d.readUTF();
+            m.enc = d.readUTF();
+            m.etag = d.readUTF();
+            m.lastMod = d.readUTF();
+            int n = d.readInt();
+            for (int i = 0; i < n; i++) {
+                String k = d.readUTF();
+                String v = d.readUTF();
+                m.headers.put(k, v);
+            }
+        }
+        return m;
+    }
+
+    private static void writeMeta(File f, Meta m) throws IOException {
+        try (DataOutputStream d = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(f)))) {
+            d.writeUTF(m.mime);
+            d.writeUTF(m.enc);
+            d.writeUTF(m.etag);
+            d.writeUTF(m.lastMod);
+            d.writeInt(m.headers.size());
+            for (Map.Entry<String, String> e : m.headers.entrySet()) {
+                d.writeUTF(e.getKey());
+                d.writeUTF(e.getValue());
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- утилиты
+
+    private static void pump(InputStream in, OutputStream out) throws IOException {
+        byte[] buf = new byte[16384];
+        int n;
+        while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
     }
 
     private static WebResourceResponse offline(boolean mainFrame) {

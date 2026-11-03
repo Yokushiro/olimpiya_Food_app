@@ -43,7 +43,7 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(Color.parseColor(BG));
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
 
-        cache = new CacheStore(new File(getFilesDir(), "webcache"));
+        cache = new CacheStore(new File(getFilesDir(), "webcache"), getAssets());
 
         web = new WebView(this);
         web.setBackgroundColor(Color.parseColor(BG));
