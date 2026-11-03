@@ -9,15 +9,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download site images into the app
+        continue-on-error: true
+        working-directory: tools
+        run: |
+          npm install playwright@1.48.2 --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          node fetch-images.js
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
+
+
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
+
       - uses: actions/upload-artifact@v4
         with:
           name: OlimpiaFood-apk
