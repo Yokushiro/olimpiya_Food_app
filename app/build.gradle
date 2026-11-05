@@ -2,6 +2,10 @@ plugins {
     id 'com.android.application'
 }
 
+// Данные подписи приходят из GitHub Secrets (см. .github/workflows/build.yml).
+// Если их нет, release-подпись не включается, и собирается обычная debug-версия.
+def keystorePath = System.getenv("KEYSTORE_PATH")
+
 android {
     namespace 'ru.olimpiafood.menu'
     compileSdk 34
@@ -10,12 +14,29 @@ android {
         applicationId "ru.olimpiafood.menu"
         minSdk 24
         targetSdk 34
-        versionCode 1
+        // versionCode растёт с каждой сборкой на GitHub, чтобы обновления ставились поверх старой версии
+        versionCode Integer.parseInt(System.getenv("GITHUB_RUN_NUMBER") ?: "1")
         versionName "1.0"
     }
 
+    signingConfigs {
+        release {
+            if (keystorePath) {
+                storeFile file(keystorePath)
+                storePassword System.getenv("KEYSTORE_PASSWORD")
+                keyAlias System.getenv("KEY_ALIAS")
+                keyPassword System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
-        release { minifyEnabled false }
+        release {
+            minifyEnabled false
+            if (keystorePath) {
+                signingConfig signingConfigs.release
+            }
+        }
     }
 
     compileOptions {
